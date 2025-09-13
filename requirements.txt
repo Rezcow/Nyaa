@@ -1,3 +1,6 @@
 python-telegram-bot==21.6
 feedparser==6.0.11
 aiohttp==3.9.5
+requests>=2.31
+feedparser>=6.0.10
+Flask>=3.0
