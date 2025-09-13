@@ -1,310 +1,177 @@
-# rss_watcher.py
-import os, asyncio, json, time, re, urllib.parse as ul
-from typing import Dict, Any, List, Optional, Tuple
-from html import escape as hesc
-
+import os, time, json, threading, hashlib
+from datetime import datetime
+from flask import Flask, jsonify
+import requests
 import feedparser
-from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.constants import ParseMode
-from aiohttp import web, ClientSession, ClientTimeout
 
-# ----------------- Entorno -----------------
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-CHAT_ID   = os.environ.get("CHAT_ID", "").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+CHAT_ID   = os.getenv("CHAT_ID", "").strip()
+FEED_URL  = os.getenv("FEED_URL", "https://nyaa.si/?page=rss").strip()
 
-FEED_URL  = os.environ.get("FEED_URL", "https://nyaa.si/?page=rss").strip()
+POLL_EVERY = int(os.getenv("POLL_EVERY", "180"))
+BACKFILL_N = int(os.getenv("BACKFILL_N", "5"))
+STATE_FILE = "seen.json"
 
-SEEN_FILE    = os.environ.get("SEEN_FILE", "seen_nyaa.json").strip()
-POLL_EVERY   = int(os.environ.get("POLL_EVERY", "120"))
-MAX_ITEMS    = int(os.environ.get("MAX_ITEMS", "80"))
-PORT         = int(os.environ.get("PORT", "10000"))
-BACKFILL_N   = int(os.environ.get("BACKFILL_N", "0"))
-LOG_SKIPS    = os.environ.get("LOG_SKIPS", "false").lower() in ("1","true","yes","on")
-STARTUP_PING = os.environ.get("STARTUP_PING", "true").lower() in ("1","true","yes","on")
-CLEAR_SEEN   = os.environ.get("CLEAR_SEEN", "false").lower() in ("1","true","yes","on")
+if not BOT_TOKEN or not CHAT_ID:
+    raise SystemExit("Faltan BOT_TOKEN o CHAT_ID en variables de entorno.")
 
-# Endpoint de prueba: /test?k=tu_secreto -> envía un mensaje de prueba
-TEST_SECRET = os.environ.get("TEST_SECRET", "").strip()
+TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
-# Filtros generales (solo si los activas)
-ONLY_TRUSTED = os.environ.get("ONLY_TRUSTED", "false").lower() in ("1","true","yes","on")
-SKIP_REMAKES = os.environ.get("SKIP_REMAKES", "false").lower() in ("1","true","yes","on")
-MIN_SEEDERS  = int(os.environ.get("MIN_SEEDERS", "0"))
-
-TITLE_KEYWORDS = [k.strip() for k in os.environ.get("TITLE_KEYWORDS", "").split("|") if k.strip()]
-TITLE_REGEX = re.compile("|".join([re.escape(k) for k in TITLE_KEYWORDS]), re.I) if TITLE_KEYWORDS else None
-
-# Filtros Multi (solo si los activas)
-REQUIRE_MULTI_SUBS  = os.environ.get("REQUIRE_MULTI_SUBS", "false").lower() in ("1","true","yes","on")
-REQUIRE_MULTI_AUDIO = os.environ.get("REQUIRE_MULTI_AUDIO", "false").lower() in ("1","true","yes","on")
-REQUIRE_ANY_MULTI   = os.environ.get("REQUIRE_ANY_MULTI", "false").lower() in ("1","true","yes","on")
-
-MULTISUB_PATTERNS = [
-    r"multi[-\s_]?subs?\b", r"multi[-\s_]?subtitles?\b", r"multisubs?\b", r"multisub\b",
-    r"dual[-\s_]?subs?\b", r"multi[-\s_]?lang(?:uage)?[-\s_]?subs?\b",
-    r"multi[-\s_]?legendas?\b", r"subs?:\s*multi",
-]
-MULTIAUDIO_PATTERNS = [
-    r"multi[-\s_]?audio\b", r"dual[-\s_]?audio\b", r"2[-\s_]?audio\b", r"two[-\s_]?audio\b",
-    r"(?:eng|en)\s*\+\s*(?:spa|esp|es|jpn|jap|por|pt|ita|it|fra|fr)",
-    r"(?:jpn|jap)\s*\+\s*(?:eng|en)",
-]
-MULTISUB_RE = re.compile("|".join(MULTISUB_PATTERNS), re.I)
-MULTIAUD_RE = re.compile("|".join(MULTIAUDIO_PATTERNS), re.I)
-
-# ----------------- Utils -----------------
-def load_seen(path: str) -> Dict[str, float]:
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-def save_seen(path: str, data: Dict[str, float]) -> None:
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
-
-def entry_field(e: Any, name: str, default: Optional[str] = None) -> Optional[str]:
-    return getattr(e, name, None) or e.get(name, default)
-
-def build_magnet(infohash: str, title: str) -> str:
-    return f"magnet:?xt=urn:btih:{infohash}&dn={ul.quote(title)}"
-
-def has_multisubs_or_multiaudio(e: Any) -> Tuple[bool, bool]:
-    title = (entry_field(e, "title", "") or "")
-    desc  = (entry_field(e, "description", "") or "")
-    text  = f"{title}\n{desc}"
-    return bool(MULTISUB_RE.search(text)), bool(MULTIAUD_RE.search(text))
-
-def skip_log(e: Any, reason: str) -> bool:
-    if LOG_SKIPS:
-        t = (entry_field(e, "title", "") or "")[:140]
-        print("SKIP:", t, "|", reason)
-    return False
-
-def passes_filters(e: Any) -> bool:
-    # Por defecto NO se filtra nada.
-    if ONLY_TRUSTED and entry_field(e, "nyaa_trusted", "No") != "Yes":
-        return skip_log(e, "not trusted")
-    if SKIP_REMAKES and entry_field(e, "nyaa_remake", "No") == "Yes":
-        return skip_log(e, "remake")
-    seeders = int(entry_field(e, "nyaa_seeders", "0") or 0)
-    if seeders < MIN_SEEDERS:
-        return skip_log(e, f"seeders<{MIN_SEEDERS}")
-    if TITLE_REGEX:
-        title = entry_field(e, "title", "") or ""
-        if not TITLE_REGEX.search(title):
-            return skip_log(e, "title regex")
-    if REQUIRE_MULTI_SUBS or REQUIRE_MULTI_AUDIO or REQUIRE_ANY_MULTI:
-        has_subs, has_audio = has_multisubs_or_multiaudio(e)
-        if REQUIRE_MULTI_SUBS and not has_subs:       return skip_log(e, "need multi-subs")
-        if REQUIRE_MULTI_AUDIO and not has_audio:     return skip_log(e, "need multi-audio")
-        if REQUIRE_ANY_MULTI and not (has_subs or has_audio):
-            return skip_log(e, "need any multi")
-    return True
-
-def make_keyboard(torrent_url: str, page_url: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔗 Página",   url=page_url)],
-        [InlineKeyboardButton("⬇️ .torrent", url=torrent_url)],
-    ])
-
-async def notify(bot: Bot, chat_id: str, e: Any) -> None:
-    title       = entry_field(e, "title", "N/A") or "N/A"
-    page_url    = entry_field(e, "guid", entry_field(e, "link", "")) or ""
-    torrent_url = entry_field(e, "link", "") or ""
-    pub_date    = entry_field(e, "published", entry_field(e, "pubDate", "")) or ""
-    size        = entry_field(e, "nyaa_size", "?") or "?"
-    seeders     = entry_field(e, "nyaa_seeders", "0") or "0"
-    leechers    = entry_field(e, "nyaa_leechers", "0") or "0"
-    trusted     = entry_field(e, "nyaa_trusted", "No") or "No"
-    remake      = entry_field(e, "nyaa_remake", "No") or "No"
-    cat         = entry_field(e, "nyaa_category", entry_field(e, "category", "")) or ""
-    infohash    = entry_field(e, "nyaa_infohash", "") or ""
-
-    if not infohash:
-        print("SKIP (sin infohash):", title[:120])
-        return
-
-    magnet = build_magnet(infohash, title)
-
-    # Escapar para HTML de Telegram
-    t_title   = hesc(title)
-    t_pubdate = hesc(pub_date)
-    t_cat     = hesc(cat)
-    t_size    = hesc(str(size))
-    t_seed    = hesc(str(seeders))
-    t_leech   = hesc(str(leechers))
-    t_trusted = hesc(trusted)
-    t_remake  = hesc(remake)
-    t_magnet  = hesc(magnet)
-
-    text = (
-        f"<b>{t_title}</b>\n"
-        f"📅 <i>{t_pubdate}</i>\n"
-        f"📂 {t_cat} | 💾 {t_size}\n"
-        f"🌱 {t_seed} seeders · ⬇️ {t_leech} leechers\n"
-        f"✅ Trusted: {t_trusted} · ♻️ Remake: {t_remake}\n\n"
-        f"<b>Magnet:</b>\n<code>{t_magnet}</code>\n"
-    )
-
-    await bot.send_message(
-        chat_id=chat_id,
-        text=text,
-        parse_mode=ParseMode.HTML,
-        disable_web_page_preview=True,
-        reply_markup=make_keyboard(torrent_url, page_url),
-    )
-
-# ----------------- Fetch del feed -----------------
-TIMEOUT = ClientTimeout(total=20)
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; NyaaWatcher/1.1; +https://render.com)",
+session = requests.Session()
+session.headers.update({
+    # evitar bloqueos de Nyaa/Cloudflare
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/120.0 Safari/537.36",
     "Accept": "application/rss+xml,application/xml;q=0.9,*/*;q=0.8",
-}
+})
 
-async def fetch_entries() -> List[Any]:
+def log(msg):
+    print(f"[{datetime.utcnow().isoformat()}Z] {msg}", flush=True)
+
+def load_seen():
     try:
-        async with ClientSession(timeout=TIMEOUT, headers=HEADERS) as s:
-            async with s.get(FEED_URL) as r:
-                data = await r.read()
-        d = feedparser.parse(data)
-        entries = d.entries[:MAX_ITEMS] if d.entries else []
-        print(f"[RSS] Fetched {len(entries)} entries")
-        return entries
-    except Exception as ex:
-        print("Fetch RSS error:", ex)
-        return []
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            return set(json.load(f))
+    except Exception:
+        return set()
 
-# ----------------- Loop principal -----------------
-def key_for(e: Any) -> str:
-    guid = entry_field(e, "id", entry_field(e, "guid", entry_field(e, "link", ""))) or ""
-    infohash = entry_field(e, "nyaa_infohash", "")
-    return guid or infohash or (entry_field(e, "title", "") + "|" + entry_field(e, "published", ""))
-
-async def fetch_new(bot: Bot, chat_id: str, seen: Dict[str, float]) -> int:
-    entries = await fetch_entries()
-    new_count = 0
-    for e in reversed(entries):  # antiguo -> nuevo
-        k = key_for(e)
-        if not k or k in seen:          continue
-        if not passes_filters(e):       continue
-        try:
-            await notify(bot, chat_id, e)
-            seen[k] = time.time()
-            new_count += 1
-        except Exception as ex:
-            print("notify error:", ex)
-    if len(seen) > 2000:
-        pruned = dict(sorted(seen.items(), key=lambda kv: kv[1], reverse=True)[:1200])
-        seen.clear(); seen.update(pruned)
-    return new_count
-
-async def poll_loop(bot: Bot) -> None:
-    if not BOT_TOKEN or not CHAT_ID:
-        print("Faltan BOT_TOKEN o CHAT_ID"); return
-
-    seen = load_seen(SEEN_FILE)
-
-    if CLEAR_SEEN:
-        print("[Init] CLEAR_SEEN=true -> limpiando historial")
-        seen.clear()
-        save_seen(SEEN_FILE, seen)
-
-    # Arranque: backfill opcional o marcar existentes como vistos
+def save_seen(seen):
     try:
-        entries = await fetch_entries()
-        print(f"[Init] entries={len(entries)} BACKFILL_N={BACKFILL_N}")
-        if BACKFILL_N > 0:
-            enviados = 0
-            for e in entries[-BACKFILL_N:]:
-                k = key_for(e)
-                if not k or k in seen: continue
-                if not passes_filters(e): continue
-                try:
-                    await notify(bot, CHAT_ID, e)
-                    seen[k] = time.time()
-                    enviados += 1
-                except Exception as ex:
-                    print("notify(backfill) error:", ex)
-            print(f"[Init] backfill enviados={enviados}")
-            save_seen(SEEN_FILE, seen)
-        else:
-            for e in entries:
-                k = key_for(e)
-                if k: seen.setdefault(k, time.time())
-            save_seen(SEEN_FILE, seen)
-    except Exception as ex:
-        print("Init scan error:", ex)
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(sorted(list(seen)), f)
+    except Exception as e:
+        log(f"Error guardando {STATE_FILE}: {e}")
+
+def fetch_feed():
+    """Descarga el RSS con headers propios y lo pasa a feedparser."""
+    try:
+        resp = session.get(FEED_URL, timeout=25)
+        resp.raise_for_status()
+        parsed = feedparser.parse(resp.content)
+        if parsed.bozo:
+            log(f"feedparser.bozo=True (posible error en RSS): {parsed.bozo_exception}")
+        return parsed
+    except Exception as e:
+        log(f"Error al descargar feed: {e}")
+        return None
+
+def entry_id(e):
+    """ID estable por entry: usa guid si hay; si no, hash del título+link."""
+    guid = e.get("id") or e.get("guid")
+    if guid:
+        return str(guid)
+    raw = f"{e.get('title','')}|{e.get('link','')}"
+    return hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest()
+
+def to_magnet(e):
+    # feedparser convierte <nyaa:infoHash> -> e['nyaa_infohash']
+    ih = (
+        e.get("nyaa_infohash") or
+        e.get("nyaa:infohash") or
+        # algunos feeds incluyen hash en description; último intento:
+        None
+    )
+    if ih:
+        ih = str(ih).strip()
+        return f"magnet:?xt=urn:btih:{ih}"
+    return None
+
+def fmt_entry(e):
+    title = e.get("title", "(sin título)")
+    view  = e.get("link") or e.get("guid") or ""
+    size  = e.get("nyaa_size") or e.get("nyaa:size") or ""
+    cat   = e.get("nyaa_category") or e.get("nyaa:category") or ""
+    magnet = to_magnet(e) or "(sin magnet en feed)"
+    lines = [
+        f"🆕 <b>{title}</b>",
+        f"📂 <i>{cat}</i>  •  💾 {size}".strip(),
+        f"🧲 <code>{magnet}</code>",
+    ]
+    if view:
+        lines.append(f"🔗 <a href=\"{view}\">Ver en Nyaa</a>")
+    return "\n".join([l for l in lines if l])
+
+def send_tg(text):
+    try:
+        r = session.post(
+            TG_API,
+            data={
+                "chat_id": CHAT_ID,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True
+            },
+            timeout=20
+        )
+        if r.status_code != 200:
+            log(f"Telegram error {r.status_code}: {r.text[:200]}")
+        return r.ok
+    except Exception as e:
+        log(f"Error enviando a Telegram: {e}")
+        return False
+
+def announce_start():
+    send_tg(f"🧑‍🚀📺 Nyaa watcher iniciado.\nFeed: <a href=\"{FEED_URL}\">{FEED_URL}</a>")
+
+def process_entries(entries, seen, mode):
+    """mode='backfill' o 'live' solo para log."""
+    sent = 0
+    # ordenar por fecha asc para enviar en orden cronológico
+    def sort_key(e):
+        return e.get("published_parsed") or e.get("updated_parsed") or 0
+    for e in sorted(entries, key=sort_key):
+        eid = entry_id(e)
+        if eid in seen:
+            continue
+        text = fmt_entry(e)
+        ok = send_tg(text)
+        if ok:
+            sent += 1
+            seen.add(eid)
+        time.sleep(0.8)  # para no pegarle tan rápido a Telegram
+    if sent:
+        save_seen(seen)
+    log(f"{mode}: enviados {sent} nuevos.")
+
+def poll_loop():
+    seen = load_seen()
+    announce_start()
+
+    # BACKFILL en arranque
+    parsed = fetch_feed()
+    if parsed and parsed.entries:
+        log(f"Arranque: feed con {len(parsed.entries)} items.")
+        if BACKFILL_N > 0 and not seen:
+            backfill = parsed.entries[:BACKFILL_N]
+            log(f"Backfill de {len(backfill)} items.")
+            process_entries(backfill, seen, mode="backfill")
 
     while True:
-        try:
-            new_n = await fetch_new(bot, CHAT_ID, seen)
-            if new_n:
-                print(f"[RSS] Enviados {new_n} nuevos")
-                save_seen(SEEN_FILE, seen)
-        except Exception as ex:
-            print("Error en fetch_new:", ex)
-        await asyncio.sleep(POLL_EVERY)
+        parsed = fetch_feed()
+        if parsed is None:
+            time.sleep(POLL_EVERY)
+            continue
 
-# ----------------- Web (health + test) -----------------
-async def health(_): return web.Response(text="ok")
+        total = len(parsed.entries or [])
+        log(f"Poll: feed trae {total} items.")
+        if total:
+            # En modo “live” enviamos los que aún no estén en seen
+            process_entries(parsed.entries, seen, mode="live")
+        time.sleep(POLL_EVERY)
 
-async def test_handler(request: web.Request):
-    if not TEST_SECRET:
-        return web.Response(status=400, text="No TEST_SECRET set")
-    if request.query.get("k") != TEST_SECRET:
-        return web.Response(status=403, text="forbidden")
-    try:
-        bot = request.app["bot"]
-        await bot.send_message(
-            chat_id=CHAT_ID,
-            text=f"✅ Test OK\nWatching: {FEED_URL}",
-            disable_web_page_preview=True,
-        )
-        return web.Response(text="sent")
-    except Exception as ex:
-        return web.Response(status=500, text=f"send error: {ex}")
+# --------- Flask health ---------
+app = Flask(__name__)
 
-async def start_web(bot: Bot) -> web.AppRunner:
-    app = web.Application()
-    app["bot"] = bot
-    app.router.add_get("/health", health)
-    app.router.add_get("/test", test_handler)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-    print(f"Servidor web en :{PORT} (/health, /test)")
-    return runner
+@app.route("/health")
+def health():
+    return jsonify(ok=True, feed=FEED_URL), 200
 
-# ----------------- Main -----------------
-async def main():
-    if not BOT_TOKEN or not CHAT_ID:
-        raise SystemExit("Define BOT_TOKEN y CHAT_ID en variables de entorno.")
-    bot = Bot(token=BOT_TOKEN)
-
-    runner = await start_web(bot)
-
-    if STARTUP_PING:
-        try:
-            await bot.send_message(chat_id=CHAT_ID, text=f"🚀 Nyaa watcher iniciado.\nFeed: {FEED_URL}")
-        except Exception as ex:
-            print("Startup ping error:", ex)
-
-    print(f"[Watcher] FEED_URL={FEED_URL}")
-    print(f"[General] ONLY_TRUSTED={ONLY_TRUSTED} SKIP_REMAKES={SKIP_REMAKES} MIN_SEEDERS={MIN_SEEDERS}")
-    print(f"[Title regex] {TITLE_REGEX.pattern if TITLE_REGEX else '(none)'}")
-    print(f"[Multi] REQUIRE_MULTI_SUBS={REQUIRE_MULTI_SUBS} REQUIRE_MULTI_AUDIO={REQUIRE_MULTI_AUDIO} REQUIRE_ANY_MULTI={REQUIRE_ANY_MULTI}")
-    print(f"[Backfill] BACKFILL_N={BACKFILL_N} | POLL_EVERY={POLL_EVERY}s | MAX_ITEMS={MAX_ITEMS} | CLEAR_SEEN={CLEAR_SEEN}")
-
-    try:
-        await poll_loop(bot)
-    finally:
-        await runner.cleanup()
+def run_watcher():
+    poll_loop()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # thread para el watcher + servidor web para Render/uptime
+    t = threading.Thread(target=run_watcher, daemon=True)
+    t.start()
+    port = int(os.getenv("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port)
