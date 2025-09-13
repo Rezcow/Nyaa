@@ -1,6 +1,7 @@
 # rss_watcher.py
 import os, asyncio, json, time, re, urllib.parse as ul
 from typing import Dict, Any, List, Optional, Tuple
+from html import escape as hesc
 
 import feedparser
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
@@ -11,16 +12,16 @@ from aiohttp import web, ClientSession, ClientTimeout
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 CHAT_ID   = os.environ.get("CHAT_ID", "").strip()
 
-# RSS (todo Nyaa por defecto)
 FEED_URL  = os.environ.get("FEED_URL", "https://nyaa.si/?page=rss").strip()
 
-SEEN_FILE   = os.environ.get("SEEN_FILE", "seen_nyaa.json").strip()
-POLL_EVERY  = int(os.environ.get("POLL_EVERY", "120"))
-MAX_ITEMS   = int(os.environ.get("MAX_ITEMS", "80"))
-PORT        = int(os.environ.get("PORT", "10000"))
-BACKFILL_N  = int(os.environ.get("BACKFILL_N", "0"))
-LOG_SKIPS   = os.environ.get("LOG_SKIPS", "false").lower() in ("1","true","yes","on")
+SEEN_FILE    = os.environ.get("SEEN_FILE", "seen_nyaa.json").strip()
+POLL_EVERY   = int(os.environ.get("POLL_EVERY", "120"))
+MAX_ITEMS    = int(os.environ.get("MAX_ITEMS", "80"))
+PORT         = int(os.environ.get("PORT", "10000"))
+BACKFILL_N   = int(os.environ.get("BACKFILL_N", "0"))
+LOG_SKIPS    = os.environ.get("LOG_SKIPS", "false").lower() in ("1","true","yes","on")
 STARTUP_PING = os.environ.get("STARTUP_PING", "true").lower() in ("1","true","yes","on")
+CLEAR_SEEN   = os.environ.get("CLEAR_SEEN", "false").lower() in ("1","true","yes","on")
 
 # Endpoint de prueba: /test?k=tu_secreto -> envía un mensaje de prueba
 TEST_SECRET = os.environ.get("TEST_SECRET", "").strip()
@@ -85,10 +86,7 @@ def skip_log(e: Any, reason: str) -> bool:
     return False
 
 def passes_filters(e: Any) -> bool:
-    """
-    Por defecto NO se filtra nada: se envía TODO.
-    Solo se aplican filtros si activas variables.
-    """
+    # Por defecto NO se filtra nada.
     if ONLY_TRUSTED and entry_field(e, "nyaa_trusted", "No") != "Yes":
         return skip_log(e, "not trusted")
     if SKIP_REMAKES and entry_field(e, "nyaa_remake", "No") == "Yes":
@@ -115,32 +113,44 @@ def make_keyboard(torrent_url: str, page_url: str) -> InlineKeyboardMarkup:
     ])
 
 async def notify(bot: Bot, chat_id: str, e: Any) -> None:
-    title       = entry_field(e, "title", "N/A")
-    page_url    = entry_field(e, "guid", entry_field(e, "link", ""))
-    torrent_url = entry_field(e, "link", "")
-    pub_date    = entry_field(e, "published", entry_field(e, "pubDate", ""))
-    size        = entry_field(e, "nyaa_size", "?")
-    seeders     = entry_field(e, "nyaa_seeders", "0")
-    leechers    = entry_field(e, "nyaa_leechers", "0")
-    trusted     = entry_field(e, "nyaa_trusted", "No")
-    remake      = entry_field(e, "nyaa_remake", "No")
+    title       = entry_field(e, "title", "N/A") or "N/A"
+    page_url    = entry_field(e, "guid", entry_field(e, "link", "")) or ""
+    torrent_url = entry_field(e, "link", "") or ""
+    pub_date    = entry_field(e, "published", entry_field(e, "pubDate", "")) or ""
+    size        = entry_field(e, "nyaa_size", "?") or "?"
+    seeders     = entry_field(e, "nyaa_seeders", "0") or "0"
+    leechers    = entry_field(e, "nyaa_leechers", "0") or "0"
+    trusted     = entry_field(e, "nyaa_trusted", "No") or "No"
+    remake      = entry_field(e, "nyaa_remake", "No") or "No"
     cat         = entry_field(e, "nyaa_category", entry_field(e, "category", "")) or ""
-    infohash    = entry_field(e, "nyaa_infohash", "")
+    infohash    = entry_field(e, "nyaa_infohash", "") or ""
 
     if not infohash:
-        # sin infohash no hay magnet; lo registramos y salimos
-        print("SKIP (sin infohash):", (title or "")[:120])
+        print("SKIP (sin infohash):", title[:120])
         return
 
     magnet = build_magnet(infohash, title)
+
+    # Escapar para HTML de Telegram
+    t_title   = hesc(title)
+    t_pubdate = hesc(pub_date)
+    t_cat     = hesc(cat)
+    t_size    = hesc(str(size))
+    t_seed    = hesc(str(seeders))
+    t_leech   = hesc(str(leechers))
+    t_trusted = hesc(trusted)
+    t_remake  = hesc(remake)
+    t_magnet  = hesc(magnet)
+
     text = (
-        f"<b>{title}</b>\n"
-        f"📅 <i>{pub_date}</i>\n"
-        f"📂 {cat} | 💾 {size}\n"
-        f"🌱 {seeders} seeders · ⬇️ {leechers} leechers\n"
-        f"✅ Trusted: {trusted} · ♻️ Remake: {remake}\n\n"
-        f"<b>Magnet:</b>\n<code>{magnet}</code>\n"
+        f"<b>{t_title}</b>\n"
+        f"📅 <i>{t_pubdate}</i>\n"
+        f"📂 {t_cat} | 💾 {t_size}\n"
+        f"🌱 {t_seed} seeders · ⬇️ {t_leech} leechers\n"
+        f"✅ Trusted: {t_trusted} · ♻️ Remake: {t_remake}\n\n"
+        f"<b>Magnet:</b>\n<code>{t_magnet}</code>\n"
     )
+
     await bot.send_message(
         chat_id=chat_id,
         text=text,
@@ -149,10 +159,10 @@ async def notify(bot: Bot, chat_id: str, e: Any) -> None:
         reply_markup=make_keyboard(torrent_url, page_url),
     )
 
-# ----------------- Fetch del feed con UA -----------------
+# ----------------- Fetch del feed -----------------
 TIMEOUT = ClientTimeout(total=20)
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; NyaaWatcher/1.0; +https://render.com)",
+    "User-Agent": "Mozilla/5.0 (compatible; NyaaWatcher/1.1; +https://render.com)",
     "Accept": "application/rss+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
@@ -178,7 +188,7 @@ def key_for(e: Any) -> str:
 async def fetch_new(bot: Bot, chat_id: str, seen: Dict[str, float]) -> int:
     entries = await fetch_entries()
     new_count = 0
-    for e in reversed(entries):  # procesar antiguo->nuevo
+    for e in reversed(entries):  # antiguo -> nuevo
         k = key_for(e)
         if not k or k in seen:          continue
         if not passes_filters(e):       continue
@@ -199,10 +209,17 @@ async def poll_loop(bot: Bot) -> None:
 
     seen = load_seen(SEEN_FILE)
 
+    if CLEAR_SEEN:
+        print("[Init] CLEAR_SEEN=true -> limpiando historial")
+        seen.clear()
+        save_seen(SEEN_FILE, seen)
+
     # Arranque: backfill opcional o marcar existentes como vistos
     try:
         entries = await fetch_entries()
+        print(f"[Init] entries={len(entries)} BACKFILL_N={BACKFILL_N}")
         if BACKFILL_N > 0:
+            enviados = 0
             for e in entries[-BACKFILL_N:]:
                 k = key_for(e)
                 if not k or k in seen: continue
@@ -210,8 +227,10 @@ async def poll_loop(bot: Bot) -> None:
                 try:
                     await notify(bot, CHAT_ID, e)
                     seen[k] = time.time()
+                    enviados += 1
                 except Exception as ex:
                     print("notify(backfill) error:", ex)
+            print(f"[Init] backfill enviados={enviados}")
             save_seen(SEEN_FILE, seen)
         else:
             for e in entries:
@@ -268,10 +287,8 @@ async def main():
         raise SystemExit("Define BOT_TOKEN y CHAT_ID en variables de entorno.")
     bot = Bot(token=BOT_TOKEN)
 
-    # Web primero (para Render)
     runner = await start_web(bot)
 
-    # Ping de arranque para validar Chat ID / permisos
     if STARTUP_PING:
         try:
             await bot.send_message(chat_id=CHAT_ID, text=f"🚀 Nyaa watcher iniciado.\nFeed: {FEED_URL}")
@@ -282,10 +299,10 @@ async def main():
     print(f"[General] ONLY_TRUSTED={ONLY_TRUSTED} SKIP_REMAKES={SKIP_REMAKES} MIN_SEEDERS={MIN_SEEDERS}")
     print(f"[Title regex] {TITLE_REGEX.pattern if TITLE_REGEX else '(none)'}")
     print(f"[Multi] REQUIRE_MULTI_SUBS={REQUIRE_MULTI_SUBS} REQUIRE_MULTI_AUDIO={REQUIRE_MULTI_AUDIO} REQUIRE_ANY_MULTI={REQUIRE_ANY_MULTI}")
-    print(f"[Backfill] BACKFILL_N={BACKFILL_N} | POLL_EVERY={POLL_EVERY}s | MAX_ITEMS={MAX_ITEMS}")
+    print(f"[Backfill] BACKFILL_N={BACKFILL_N} | POLL_EVERY={POLL_EVERY}s | MAX_ITEMS={MAX_ITEMS} | CLEAR_SEEN={CLEAR_SEEN}")
 
     try:
-        await poll_loop(bot)  # loop infinito
+        await poll_loop(bot)
     finally:
         await runner.cleanup()
 
